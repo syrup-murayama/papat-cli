@@ -1,0 +1,15 @@
+#!/bin/zsh
+setopt no_unset
+if [[ "$1" == '-g' ]]; then
+  file="${@[-1]}"
+  if [[ "${file:t}" == 'large.jpg' ]]; then
+    print -r -- "$file\n  pixelWidth: 3600\n  pixelHeight: 2400\n  profile: Display P3"
+  else
+    print -r -- "$file\n  pixelWidth: 1600\n  pixelHeight: 1200\n  profile: sRGB IEC61966-2.1"
+  fi
+  exit 0
+fi
+input="${@[-3]}"
+output="${@[-1]}"
+print -r -- "${input:t}" >> "$MOCK_SIPS_LOG"
+cp "$input" "$output"

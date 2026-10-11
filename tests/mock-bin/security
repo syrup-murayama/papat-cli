@@ -1,0 +1,15 @@
+#!/bin/zsh
+setopt no_unset
+case "$1" in
+  find-generic-password)
+    [[ -f "$HOME/.mock-keychain" ]] || exit 44
+    cat "$HOME/.mock-keychain"
+    ;;
+  add-generic-password)
+    cat > "$HOME/.mock-keychain"
+    ;;
+  delete-generic-password)
+    rm -f "$HOME/.mock-keychain"
+    ;;
+  *) exit 2 ;;
+esac

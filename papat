@@ -1,0 +1,822 @@
+#!/bin/zsh
+
+setopt extendedglob pipefail
+umask 077
+
+typeset -gr PAPAT_API_BASE='https://papat.app'
+typeset -gr PAPAT_KEYCHAIN_SERVICE='app.papat.cli'
+typeset -gr PAPAT_KEYCHAIN_ACCOUNT='integration-api-key'
+typeset -gr PAPAT_STATE_ROOT="$HOME/.local/state/papat-cli"
+typeset -gr PAPAT_JOBS_DIR="$PAPAT_STATE_ROOT/jobs"
+typeset -gr PAPAT_LOGS_DIR="$PAPAT_STATE_ROOT/logs"
+typeset -gr PAPAT_SRGB_PROFILE='/System/Library/ColorSync/Profiles/sRGB Profile.icc'
+typeset -gr PAPAT_VERSION='0.1.0'
+typeset -gr PAPAT_PUBLIC_BASE='https://papat.app'
+
+typeset -g API_STATUS=''
+typeset -g API_BODY=''
+typeset -g API_CURL_RC=0
+typeset -g API_RETRY_AFTER=''
+typeset -g JOB_DIR=''
+typeset -g STATE_FILE=''
+typeset -g LOG_FILE=''
+typeset -g JOB_ID=''
+typeset -g JOB_STATUS=''
+typeset -g JOB_PID=''
+typeset -g SID=''
+typeset -g TENANT_ID=''
+typeset -g SOURCE_DIR=''
+typeset -g TITLE=''
+typeset -g DAYS='7'
+typeset -g KEY_COLOR=''
+typeset -g PASSCODE=''
+typeset -g IDEMPOTENCY_KEY=''
+typeset -g SHARE_URL=''
+typeset -g EXPIRES_AT=''
+typeset -ga SOURCE_FILES=()
+typeset -ga RELATIVE_FILES=()
+
+function fail() {
+  print -u2 -r -- "papat: $*"
+  exit 1
+}
+
+function usage() {
+  cat <<'USAGE'
+papat — papat gallery CLI
+
+Usage:
+  papat login
+  papat --version
+  papat status [--json]
+  papat upload <folder> [--title <title>] [--days 7|14]
+              [--key-color #RRGGBB] [--passcode <value>] [--background] [--json]
+  papat jobs [--json]
+  papat list [--json]
+  papat selections <sid> [--json]
+  papat extend <sid>
+  papat close <sid>
+
+`papat login` reads the API key through the macOS Keychain prompt. Keys cannot
+be supplied as command arguments or environment variables.
+
+Source photos are not changed. Upload copies have EXIF, GPS, XMP, IPTC, comments,
+and other non-color metadata removed; ICC is preserved or set to sRGB if missing.
+USAGE
+}
+
+function ensure_state_dirs() {
+  command mkdir -p "$PAPAT_JOBS_DIR" "$PAPAT_LOGS_DIR" || fail '状態ディレクトリを作成できません'
+  command chmod 700 "$PAPAT_STATE_ROOT" "$PAPAT_JOBS_DIR" "$PAPAT_LOGS_DIR" 2>/dev/null
+}
+
+function get_api_key() {
+  local key
+  key=$(command security find-generic-password -s "$PAPAT_KEYCHAIN_SERVICE" -a "$PAPAT_KEYCHAIN_ACCOUNT" -w 2>/dev/null) \
+    || fail '未ログインです。ターミナルで `papat login` を実行してください'
+  [[ -n "$key" ]] || fail 'Keychain に API キーがありません。`papat login` を実行してください'
+  REPLY="$key"
+}
+
+function api_request() {
+  local api_key="$1" method="$2" request_path="$3"
+  shift 3
+  local body_file headers_file response_file
+  local -a curl_args
+  ensure_state_dirs
+  body_file=$(command mktemp "$PAPAT_STATE_ROOT/response.XXXXXX") || fail '一時ファイルを作成できません'
+  headers_file=$(command mktemp "$PAPAT_STATE_ROOT/headers.XXXXXX") || fail '一時ファイルを作成できません'
+  response_file=$(command mktemp "$PAPAT_STATE_ROOT/status.XXXXXX") || fail '一時ファイルを作成できません'
+  curl_args=(--silent --show-error --request "$method" --url "$PAPAT_API_BASE$request_path"
+    --dump-header "$headers_file" --output "$body_file" --write-out '%{http_code}' "$@")
+  builtin printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' "$api_key" \
+    | command curl --config - "${curl_args[@]}" > "$response_file"
+  API_CURL_RC=$?
+  API_STATUS=$(<"$response_file")
+  API_BODY=$(<"$body_file")
+  API_RETRY_AFTER=$(command sed -n 's/^[Rr]etry-[Aa]fter:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$headers_file" | command sed -n '$p')
+  command rm -f "$body_file" "$response_file" "$headers_file"
+  if (( API_CURL_RC != 0 )); then
+    return 1
+  fi
+}
+
+function api_error() {
+  local body="$1"
+  if [[ "$body" =~ '"error"[[:space:]]*:[[:space:]]*"([^"\\]*(\\.[^"\\]*)*)"' ]]; then
+    REPLY="$match[1]"
+  else
+    REPLY='API request failed'
+  fi
+}
+
+function require_success() {
+  local action="$1"
+  if [[ ! "$API_STATUS" == 2[0-9][0-9] ]]; then
+    api_error "$API_BODY"
+    fail "$action: HTTP ${API_STATUS:-000} — $REPLY"
+  fi
+}
+
+function json_escape() {
+  local input="$1" output='' ch
+  local -a chars
+  chars=("${(@s::)input}")
+  for ch in "${chars[@]}"; do
+    case "$ch" in
+      '"') output+='\\"' ;;
+      '\\') output+='\\\\' ;;
+      $'\n') output+='\\n' ;;
+      $'\r') output+='\\r' ;;
+      $'\t') output+='\\t' ;;
+      *) output+="$ch" ;;
+    esac
+  done
+  REPLY="$output"
+}
+
+function json_field() {
+  local json="$1" field="$2"
+  if [[ "$json" =~ "\"${field}\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9_-]+)\"" ]]; then
+    REPLY="$match[1]"
+  else
+    REPLY=''
+  fi
+}
+
+function load_state() {
+  local line key value
+  [[ -f "$STATE_FILE" ]] || fail 'アップロードの状態がありません'
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      job_id) JOB_ID="$value" ;;
+      status) JOB_STATUS="$value" ;;
+      pid) JOB_PID="$value" ;;
+      sid) SID="$value" ;;
+      tenant_id) TENANT_ID="$value" ;;
+      source_dir) SOURCE_DIR="$value" ;;
+      title) TITLE="$value" ;;
+      days) DAYS="$value" ;;
+      key_color) KEY_COLOR="$value" ;;
+      passcode) PASSCODE="$value" ;;
+      idempotency_key) IDEMPOTENCY_KEY="$value" ;;
+      share_url) SHARE_URL="$value" ;;
+      expires_at) EXPIRES_AT="$value" ;;
+    esac
+  done < "$STATE_FILE"
+}
+
+function write_state() {
+  local temporary="$JOB_DIR/state.tmp.$$"
+  {
+    print -r -- "job_id=$JOB_ID"
+    print -r -- "status=$JOB_STATUS"
+    print -r -- "pid=$JOB_PID"
+    print -r -- "sid=$SID"
+    print -r -- "tenant_id=$TENANT_ID"
+    print -r -- "source_dir=$SOURCE_DIR"
+    print -r -- "title=$TITLE"
+    print -r -- "days=$DAYS"
+    print -r -- "key_color=$KEY_COLOR"
+    print -r -- "passcode=$PASSCODE"
+    print -r -- "idempotency_key=$IDEMPOTENCY_KEY"
+    print -r -- "share_url=$SHARE_URL"
+    print -r -- "expires_at=$EXPIRES_AT"
+  } > "$temporary" || fail 'アップロード状態を保存できません'
+  command chmod 600 "$temporary"
+  command mv -f "$temporary" "$STATE_FILE"
+}
+
+function collect_sources() {
+  local dir="$1" file relative basename stem
+  typeset -A seen_stems
+  SOURCE_FILES=()
+  RELATIVE_FILES=()
+  while IFS= read -r -d $'\0' file; do
+    [[ "$file" == *$'\n'* ]] && fail '改行を含むファイル名には対応していません'
+    SOURCE_FILES+=("$file")
+  done < <(command find "$dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) -print0)
+  SOURCE_FILES=("${(@o)SOURCE_FILES}")
+  (( ${#SOURCE_FILES} > 0 )) || fail 'JPEG ファイルが見つかりません'
+  (( ${#SOURCE_FILES} <= 900 )) || fail '1ギャラリーの上限は900枚です'
+  for file in "${SOURCE_FILES[@]}"; do
+    relative="${file#"$dir"/}"
+    basename="${relative:t}"
+    stem="${basename%.*}"
+    [[ -n "$stem" ]] || fail "ファイル名を確認してください: $relative"
+    if [[ -n "${seen_stems[${stem:l}]-}" ]]; then
+      fail "同じファイル名 stem が重複しています: $stem"
+    fi
+    seen_stems[${stem:l}]=1
+    RELATIVE_FILES+=("$relative")
+  done
+}
+
+function folder_job_id() {
+  local digest
+  digest=$(builtin printf '%s' "$1" | command shasum -a 256) || fail 'フォルダ識別子を生成できません'
+  REPLY="${digest%% *}"
+}
+
+function create_gallery() {
+  local api_key attempt sid_value tenant_value retry_after
+  [[ -f "$JOB_DIR/create.json" ]] || fail 'ギャラリー作成の再試行データがありません'
+  get_api_key; api_key="$REPLY"
+  for attempt in {1..6}; do
+    api_request "$api_key" POST '/api/v1/galleries' \
+      --header 'Content-Type: application/json' \
+      --header "Idempotency-Key: $IDEMPOTENCY_KEY" \
+      --data-binary "@$JOB_DIR/create.json"
+    if (( API_CURL_RC != 0 )); then fail 'ギャラリー作成の接続に失敗しました。同じフォルダで再実行すると同一要求から再開します'; fi
+    if [[ "$API_STATUS" == '429' ]]; then
+      retry_after="${API_RETRY_AFTER:-1}"
+      [[ "$retry_after" == <-> ]] || retry_after=1
+      print -r -- "API 制限中です。${retry_after}秒待って再試行します。"
+      command sleep "$retry_after"
+      continue
+    fi
+    require_success 'ギャラリーを作成できませんでした'
+    json_field "$API_BODY" sid; sid_value="$REPLY"
+    json_field "$API_BODY" tenant_id; tenant_value="$REPLY"
+    [[ -n "$sid_value" && -n "$tenant_value" ]] || fail '作成応答に sid または tenant_id がありません'
+    SID="$sid_value"; TENANT_ID="$tenant_value"
+    SHARE_URL="$PAPAT_PUBLIC_BASE/t/$TENANT_ID/s/$SID/"
+    if [[ "$API_BODY" =~ '"expires_at"[[:space:]]*:[[:space:]]*"([^"]+)"' ]]; then EXPIRES_AT="$match[1]"; fi
+    JOB_STATUS='queued'; JOB_PID=''; write_state
+    command rm -f "$JOB_DIR/create.json"
+    return 0
+  done
+  fail '作成 API のレート制限が続きました。同じフォルダで再実行すると再開します'
+}
+
+function print_share_info() {
+  local mode="$1" background="${2:-no}" instruction
+  instruction="以下のURLから写真を選んでください。
+${SHARE_URL}
+パスコード：${PASSCODE}"
+  if [[ "$mode" == 'yes' ]]; then
+    json_escape "$TITLE"; local title_json="$REPLY"
+    json_escape "$SHARE_URL"; local url_json="$REPLY"
+    json_escape "$PASSCODE"; local code_json="$REPLY"
+    json_escape "$instruction"; local instruction_json="$REPLY"
+    if [[ "$background" == 'yes' ]]; then
+      json_escape "$LOG_FILE"; local log_json="$REPLY"
+      print -r -- "{\"ok\":true,\"sid\":\"$SID\",\"title\":\"$title_json\",\"url\":\"$url_json\",\"passcode\":\"$code_json\",\"instruction\":\"$instruction_json\",\"job_id\":\"$JOB_ID\",\"upload_status\":\"running\",\"log\":\"$log_json\"}"
+    else
+      print -r -- "{\"ok\":true,\"sid\":\"$SID\",\"title\":\"$title_json\",\"url\":\"$url_json\",\"passcode\":\"$code_json\",\"instruction\":\"$instruction_json\",\"job_id\":\"$JOB_ID\"}"
+    fi
+  else
+    print -r -- "ギャラリーを作成しました: ${TITLE:-無題}"
+    print -r -- "URL: ${SHARE_URL}"
+    print -r -- "パスコード: ${PASSCODE}"
+    print -r -- '案内文:'
+    print -r -- "以下のURLから写真を選んでください。
+${SHARE_URL}
+パスコード：${PASSCODE}"
+  fi
+}
+
+function upload_new_or_resume() {
+  local folder="$1" title="$2" days="$3" key_color="$4" passcode="$5" background="$6" json_output="$7"
+  local resolved_dir response_dir hash_output
+  ensure_state_dirs
+  [[ "$folder" != *$'\n'* ]] || fail '改行を含むフォルダパスには対応していません'
+  resolved_dir="$(builtin cd -- "$folder" 2>/dev/null && builtin pwd -P)" || fail "フォルダを開けません: $folder"
+  collect_sources "$resolved_dir"
+  folder_job_id "$resolved_dir"
+  JOB_ID="$REPLY"
+  JOB_DIR="$PAPAT_JOBS_DIR/$JOB_ID"
+  STATE_FILE="$JOB_DIR/state"
+  LOG_FILE="$PAPAT_LOGS_DIR/$JOB_ID.log"
+  if [[ -f "$STATE_FILE" ]]; then
+    load_state
+    if [[ "$JOB_STATUS" == 'completed' ]]; then command rm -rf "$JOB_DIR"; fi
+  fi
+  if [[ -f "$STATE_FILE" ]]; then
+    load_state
+    if [[ "$JOB_STATUS" == 'queued' || "$JOB_STATUS" == 'running' ]]; then
+      if [[ -n "$JOB_PID" ]] && command kill -0 "$JOB_PID" 2>/dev/null; then
+        fail "このフォルダはすでにアップロード中です。papat jobs で確認してください"
+      fi
+    fi
+    if [[ "$SOURCE_DIR" != "$resolved_dir" ]]; then fail '保存済みアップロード状態のフォルダが一致しません'; fi
+    if [[ -f "$JOB_DIR/files.list" ]]; then
+      local -a old_files=()
+      while IFS= read -r relative; do old_files+=("$relative"); done < "$JOB_DIR/files.list"
+      if (( ${#old_files} != ${#RELATIVE_FILES} )); then fail 'アップロード再開前にフォルダ内のJPEG一覧が変わりました'; fi
+      local i
+      for (( i=1; i <= ${#old_files}; i++ )); do
+        [[ "${old_files[i]}" == "${RELATIVE_FILES[i]}" ]] || fail 'アップロード再開前にフォルダ内のJPEG一覧が変わりました'
+      done
+    fi
+    title="$TITLE"; days="$DAYS"; key_color="$KEY_COLOR"; passcode="$PASSCODE"
+    if [[ "$json_output" == 'yes' ]]; then
+      print -u2 -r -- "前回のアップロードを再開します: ${JOB_ID[1,12]}"
+    else
+      print -r -- "前回のアップロードを再開します: ${JOB_ID[1,12]}"
+    fi
+  else
+    TITLE="$title"; DAYS="$days"; KEY_COLOR="$key_color"; PASSCODE="$passcode"
+    SOURCE_DIR="$resolved_dir"; SID=''; TENANT_ID=''; SHARE_URL=''; EXPIRES_AT=''
+    IDEMPOTENCY_KEY="$(command uuidgen | command tr '[:upper:]' '[:lower:]')"
+    JOB_STATUS='creating'; JOB_PID=''
+    command mkdir -p "$JOB_DIR" || fail 'アップロード状態を作成できません'
+    command chmod 700 "$JOB_DIR"
+    : > "$LOG_FILE"; command chmod 600 "$LOG_FILE"
+    write_state
+    for response_dir in "${RELATIVE_FILES[@]}"; do print -r -- "$response_dir"; done > "$JOB_DIR/files.list"
+    command chmod 600 "$JOB_DIR/files.list"
+    json_escape "$TITLE"; local title_json="$REPLY"
+    json_escape "$PASSCODE"; local passcode_json="$REPLY"
+    hash_output=$(builtin printf '%s' "$PASSCODE" | command shasum -a 256) || fail 'パスコードのハッシュを作成できません'
+    local passcode_hash="${hash_output%% *}"
+    {
+      builtin printf '{"title":"%s","days":%s,"passcode_hash":"%s","passcode":"%s","key_color":' "$title_json" "$DAYS" "$passcode_hash" "$passcode_json"
+      if [[ -n "$KEY_COLOR" ]]; then builtin printf '"%s"' "$KEY_COLOR"; else builtin printf 'null'; fi
+      builtin printf '}\n'
+    } > "$JOB_DIR/create.json" || fail 'ギャラリー作成要求を保存できません'
+    command chmod 600 "$JOB_DIR/create.json"
+  fi
+  if [[ -z "$SID" ]]; then create_gallery; fi
+  PASSCODE="$passcode"; SID="$SID"; SOURCE_DIR="$resolved_dir"
+  if [[ "$background" == 'yes' ]]; then
+    JOB_STATUS='queued'; JOB_PID=''; write_state
+    "$0" __worker "$JOB_DIR" < /dev/null >> "$LOG_FILE" 2>&1 &
+    JOB_PID=$!
+    JOB_STATUS='running'
+    write_state
+    : > "$JOB_DIR/go"
+    builtin disown "$JOB_PID" 2>/dev/null
+    print_share_info "$json_output" yes
+    if [[ "$json_output" != 'yes' ]]; then
+      print -r -- "バックグラウンドで送信を開始しました。papat jobs / $LOG_FILE で進捗を確認できます。"
+    fi
+    return 0
+  fi
+  print_share_info "$json_output"
+  JOB_STATUS='running'; JOB_PID="$$"; write_state
+  : > "$JOB_DIR/go"
+  if [[ "$json_output" == 'yes' ]]; then run_worker "$JOB_DIR" >&2; else run_worker "$JOB_DIR"; fi
+}
+
+function sips_dimensions() {
+  local file="$1" info
+  info=$(command sips -g pixelWidth -g pixelHeight -g profile "$file" 2>/dev/null) || return 1
+  local width=0 height=0 profile=''
+  if [[ "$info" =~ 'pixelWidth: ([0-9]+)' ]]; then width="$match[1]"; fi
+  if [[ "$info" =~ 'pixelHeight: ([0-9]+)' ]]; then height="$match[1]"; fi
+  if [[ "$info" =~ 'profile: (.+)' ]]; then profile="$match[1]"; fi
+  REPLY="$width:$height:$profile"
+}
+
+function url_encode_path() {
+  local input="$1" output='' ch hex
+  local LC_ALL=C
+  local i
+  for (( i=1; i <= ${#input}; i++ )); do
+    ch="${input[i]}"
+    if [[ "$ch" == [A-Za-z0-9._] || "$ch" == '-' || "$ch" == '~' ]]; then
+      output+="$ch"
+    elif [[ "$ch" == '/' ]]; then
+      output+='/'
+    else
+      builtin printf -v hex '%%%02X' "'$ch"
+      output+="$hex"
+    fi
+  done
+  REPLY="$output"
+}
+
+function source_digest() {
+  local result
+  result=$(command shasum -a 256 "$1") || return 1
+  REPLY="${result%% *}"
+}
+
+function strip_jpeg_metadata() {
+  local source="$1" destination="$2"
+  /usr/bin/perl - "$source" "$destination" "$PAPAT_SRGB_PROFILE" <<'PERL'
+use strict;
+use warnings;
+
+my ($source, $destination, $srgb_profile) = @ARGV;
+open my $input, '<:raw', $source or die "cannot read JPEG\n";
+local $/;
+my $data = <$input>;
+close $input;
+die "invalid JPEG\n" unless defined($data) && length($data) >= 4 && substr($data, 0, 2) eq "\xFF\xD8";
+
+my $output = "\xFF\xD8";
+my $position = 2;
+my $in_scan = 0;
+my $saw_scan = 0;
+my $saw_end = 0;
+my $length = length($data);
+my %icc_sequence;
+my $icc_total = 0;
+my $icc_invalid = 0;
+
+while ($position < $length) {
+  if ($in_scan) {
+    my $marker_start = index($data, "\xFF", $position);
+    if ($marker_start < 0) {
+      $output .= substr($data, $position);
+      $position = $length;
+      last;
+    }
+    $output .= substr($data, $position, $marker_start - $position);
+    my $marker_code = $marker_start + 1;
+    $marker_code++ while $marker_code < $length && substr($data, $marker_code, 1) eq "\xFF";
+    die "truncated JPEG marker\n" if $marker_code >= $length;
+    my $code = ord(substr($data, $marker_code, 1));
+    if ($code == 0x00 || ($code >= 0xD0 && $code <= 0xD7)) {
+      $output .= substr($data, $marker_start, $marker_code - $marker_start + 1);
+      $position = $marker_code + 1;
+      next;
+    }
+    $position = $marker_start;
+    $in_scan = 0;
+  }
+
+  die "invalid JPEG marker\n" unless substr($data, $position, 1) eq "\xFF";
+  my $segment_start = $position;
+  my $marker_code = $position + 1;
+  $marker_code++ while $marker_code < $length && substr($data, $marker_code, 1) eq "\xFF";
+  die "truncated JPEG marker\n" if $marker_code >= $length;
+  my $code = ord(substr($data, $marker_code, 1));
+  $position = $marker_code + 1;
+
+  if ($code == 0xD9) {
+    $output .= substr($data, $segment_start, $position - $segment_start);
+    $saw_end = 1;
+    last; # Ignore any non-image trailer after EOI.
+  }
+  if ($code == 0xD8 || $code == 0x01 || ($code >= 0xD0 && $code <= 0xD7)) {
+    $output .= substr($data, $segment_start, $position - $segment_start);
+    next;
+  }
+
+  die "truncated JPEG segment length\n" if $position + 2 > $length;
+  my $segment_length = unpack('n', substr($data, $position, 2));
+  die "invalid JPEG segment length\n" if $segment_length < 2 || $position + $segment_length > $length;
+  my $payload_start = $position + 2;
+  my $payload_length = $segment_length - 2;
+  my $payload = substr($data, $payload_start, $payload_length);
+  my $keep = 1;
+
+  if ($code >= 0xE0 && $code <= 0xEF) {
+    $keep = 0;
+    $keep = 1 if $code == 0xE0 && substr($payload, 0, 5) eq "JFIF\x00";
+    if ($code == 0xE2 && substr($payload, 0, 12) eq "ICC_PROFILE\x00") {
+      $keep = 0;
+      if ($payload_length < 14) {
+        $icc_invalid = 1;
+      } else {
+        my $sequence = ord(substr($payload, 12, 1));
+        my $total = ord(substr($payload, 13, 1));
+        if (!$sequence || !$total || $sequence > $total || ($icc_total && $icc_total != $total) || exists $icc_sequence{$sequence}) {
+          $icc_invalid = 1;
+        } else {
+          $icc_total = $total;
+          $icc_sequence{$sequence} = substr($data, $segment_start, $payload_start + $payload_length - $segment_start);
+        }
+      }
+    }
+    $keep = 1 if $code == 0xEE && substr($payload, 0, 5) eq 'Adobe';
+  }
+  $keep = 0 if $code == 0xFE; # JPEG comment
+  if ($keep) {
+    $output .= substr($data, $segment_start, $payload_start + $payload_length - $segment_start);
+  }
+  $position = $payload_start + $payload_length;
+  if ($code == 0xDA) {
+    $saw_scan = 1;
+    $in_scan = 1;
+  }
+}
+
+die "incomplete JPEG\n" unless $saw_scan && $saw_end;
+my $icc_bundle = '';
+if (!$icc_invalid && $icc_total && scalar(keys %icc_sequence) == $icc_total) {
+  for my $sequence (1 .. $icc_total) {
+    if (!exists $icc_sequence{$sequence}) { $icc_invalid = 1; last; }
+    $icc_bundle .= $icc_sequence{$sequence};
+  }
+} else {
+  $icc_invalid = 1;
+}
+if ($icc_invalid || !$icc_total) {
+  open my $profile, '<:raw', $srgb_profile or die "cannot read built-in sRGB profile\n";
+  local $/;
+  my $profile_data = <$profile>;
+  close $profile;
+  die "invalid built-in sRGB profile\n" unless defined($profile_data) && length($profile_data);
+  my $chunk_size = 65519;
+  my $count = int((length($profile_data) + $chunk_size - 1) / $chunk_size);
+  die "built-in sRGB profile is too large\n" if !$count || $count > 255;
+  for my $index (0 .. $count - 1) {
+    my $chunk = substr($profile_data, $index * $chunk_size, $chunk_size);
+    my $payload = "ICC_PROFILE\x00" . pack('CC', $index + 1, $count) . $chunk;
+    $icc_bundle .= "\xFF\xE2" . pack('n', length($payload) + 2) . $payload;
+  }
+}
+$output = substr($output, 0, 2) . $icc_bundle . substr($output, 2);
+open my $result, '>:raw', $destination or die "cannot write sanitized JPEG\n";
+print {$result} $output or die "cannot write sanitized JPEG\n";
+close $result or die "cannot finish sanitized JPEG\n";
+PERL
+}
+
+function upload_one() {
+  local source="$1" relative="$2" source_hash marker stage_path sanitized_path upload_path logical_path encoded_path filename
+  local details width height profile http_status retry_after attempt
+  source_digest "$source" || return 1
+  source_hash="$REPLY"
+  marker="$JOB_DIR/uploaded/$relative.done"
+  if [[ -f "$marker" ]] && [[ "$(<"$marker")" == "$source_hash" ]]; then
+    print -r -- "skip $relative"
+    return 0
+  fi
+  sips_dimensions "$source" || { print -u2 -r -- "sips failed: $relative"; return 1; }
+  details="$REPLY"; width="${details%%:*}"; details="${details#*:}"
+  height="${details%%:*}"; profile="${details#*:}"
+  upload_path="$source"
+  if (( width > 2048 || height > 2048 )) || [[ "$profile" != *sRGB* ]]; then
+    stage_path="$JOB_DIR/staging/$relative"
+    command mkdir -p "${stage_path:h}" || return 1
+    if ! command sips --matchTo "$PAPAT_SRGB_PROFILE" -s format jpeg -Z 2048 "$source" --out "$stage_path" >/dev/null 2>&1; then
+      print -u2 -r -- "sips conversion failed: $relative"
+      return 1
+    fi
+    upload_path="$stage_path"
+  fi
+  sanitized_path="$JOB_DIR/staging/metadata/$relative"
+  command mkdir -p "${sanitized_path:h}" || return 1
+  if ! strip_jpeg_metadata "$upload_path" "$sanitized_path"; then
+    command rm -f "$sanitized_path"
+    print -u2 -r -- "JPEG metadata cleanup failed: $relative"
+    return 1
+  fi
+  upload_path="$sanitized_path"
+  filename="${relative:t}"
+  logical_path="photos/$relative"
+  url_encode_path "$logical_path"; encoded_path="$REPLY"
+  for attempt in {1..6}; do
+    api_request "$WORKER_API_KEY" PUT "/api/v1/galleries/$SID/files/$encoded_path" \
+      --header 'Content-Type: image/jpeg' --data-binary "@$upload_path"
+    if (( API_CURL_RC != 0 )); then
+      print -u2 -r -- "network error: $filename"
+      return 1
+    fi
+    http_status="$API_STATUS"
+    if [[ "$http_status" == '429' ]]; then
+      retry_after="$API_RETRY_AFTER"
+      [[ "$retry_after" == <-> ]] || retry_after=1
+      print -r -- "rate limited; wait ${retry_after}s: $filename"
+      command sleep "$retry_after"
+      continue
+    fi
+    if [[ ! "$http_status" == 2[0-9][0-9] ]]; then
+      api_error "$API_BODY"
+      print -u2 -r -- "upload failed: $filename (HTTP $http_status: $REPLY)"
+      return 1
+    fi
+    command mkdir -p "${marker:h}" || return 1
+    builtin printf '%s\n' "$source_hash" > "$marker"
+    command chmod 600 "$marker"
+    print -r -- "uploaded $filename"
+    return 0
+  done
+  print -u2 -r -- "too many rate limit retries: $filename"
+  return 1
+}
+
+function write_manifest() {
+  local manifest="$JOB_DIR/manifest.json" relative filename stem url digest source
+  json_escape "$TITLE"; local title_json="$REPLY"
+  {
+    builtin printf '{"version":1,"title":"%s","theme":"default","key_color":' "$title_json"
+    if [[ -n "$KEY_COLOR" ]]; then builtin printf '"%s"' "$KEY_COLOR"; else builtin printf 'null'; fi
+    builtin printf ',"count":%s,"photos":[' "${#RELATIVE_FILES}"
+    local first=1
+    for relative in "${RELATIVE_FILES[@]}"; do
+      source="$SOURCE_DIR/$relative"
+      filename="${relative:t}"
+      stem="${filename%.*}"
+      url_encode_path "photos/$relative"; url="$REPLY"
+      digest=$(builtin printf '%s' "$relative" | command shasum -a 256) || return 1
+      digest="${digest%% *}"
+      json_escape "$filename"; local filename_json="$REPLY"
+      json_escape "$stem"; local stem_json="$REPLY"
+      json_escape "$url"; local url_json="$REPLY"
+      if (( first )); then first=0; else builtin printf ','; fi
+      builtin printf '{"source_id":"papat-cli-%s","stem":"%s","filename":"%s","url":"%s","rating":0,"label":"","keywords":[],"datetime":"","camera":"","group":0}' \
+        "$digest" "$stem_json" "$filename_json" "$url_json"
+    done
+    builtin printf '],"credit":"","groupThreshold":3}\n'
+  } > "$manifest" || return 1
+  command chmod 600 "$manifest"
+  REPLY="$manifest"
+}
+
+function run_worker() {
+  local dir="$1" api_key manifest_path
+  JOB_DIR="$dir"; STATE_FILE="$JOB_DIR/state"; LOG_FILE="$PAPAT_LOGS_DIR/${JOB_DIR:t}.log"
+  while [[ ! -f "$JOB_DIR/go" ]]; do command sleep 0.1; done
+  load_state
+  if [[ -z "$SID" ]]; then
+    print -u2 -r -- 'ギャラリー作成が未完了です。`papat upload` を再実行してください'
+    JOB_STATUS='failed'; write_state; return 1
+  fi
+  JOB_STATUS='running'; JOB_PID="$$"; write_state
+  get_api_key; api_key="$REPLY"; WORKER_API_KEY="$api_key"
+  collect_sources "$SOURCE_DIR"
+  local -a pids=()
+  local relative source rc failed=0
+  command mkdir -p "$JOB_DIR/uploaded" "$JOB_DIR/staging" "$JOB_DIR/tmp" || { JOB_STATUS='failed'; write_state; return 1; }
+  for relative in "${RELATIVE_FILES[@]}"; do
+    source="$SOURCE_DIR/$relative"
+    upload_one "$source" "$relative" &
+    pids+=("$!")
+    if (( ${#pids} == 4 )); then
+      for pid in "${pids[@]}"; do wait "$pid"; rc=$?; (( rc == 0 )) || failed=1; done
+      pids=()
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid"; rc=$?; (( rc == 0 )) || failed=1; done
+  if (( failed )); then
+    JOB_STATUS='failed'; JOB_PID=''; write_state
+    print -u2 -r -- "アップロードに失敗しました。papat upload ${(q)SOURCE_DIR} で未完了分から再開できます。"
+    return 1
+  fi
+  write_manifest || { JOB_STATUS='failed'; write_state; print -u2 'manifestを作成できません'; return 1; }
+  manifest_path="$REPLY"
+  api_request "$WORKER_API_KEY" PUT "/api/v1/galleries/$SID/files/manifest.json" \
+    --header 'Content-Type: application/json' --data-binary "@$manifest_path"
+  if (( API_CURL_RC != 0 )) || [[ ! "$API_STATUS" == 2[0-9][0-9] ]]; then
+    api_error "$API_BODY"
+    print -u2 -r -- "manifest の送信に失敗しました (HTTP ${API_STATUS:-000}: $REPLY)"
+    JOB_STATUS='failed'; JOB_PID=''; write_state; return 1
+  fi
+  JOB_STATUS='completed'; JOB_PID=''; PASSCODE=''; write_state
+  print -r -- "全 ${#RELATIVE_FILES} 枚をアップロードし、manifest を更新しました。ギャラリー: $SHARE_URL"
+  command rm -rf "$JOB_DIR/staging" "$JOB_DIR/uploaded" "$JOB_DIR/tmp" "$JOB_DIR/files.list" "$JOB_DIR/create.json" "$JOB_DIR/manifest.json" "$JOB_DIR/go"
+  return 0
+}
+
+function cmd_login() {
+  ensure_state_dirs
+  print -r -- 'macOS Keychain のパスワード入力欄に papat API キーを入力してください（チャットやコマンド引数には入力しません）。'
+  command security add-generic-password -U -s "$PAPAT_KEYCHAIN_SERVICE" -a "$PAPAT_KEYCHAIN_ACCOUNT" -w \
+    || fail 'Keychain への保存に失敗しました'
+  get_api_key; local api_key="$REPLY"
+  api_request "$api_key" GET '/api/v1/integration/status'
+  (( API_CURL_RC == 0 )) || fail '接続を確認できませんでした'
+  if [[ "$API_STATUS" == '401' ]]; then fail 'API キーが認証されません。ダッシュボードで再発行して再度ログインしてください'; fi
+  require_success '接続を確認できませんでした'
+  print -r -- 'papat に接続しました。'
+}
+
+function cmd_status() {
+  local json_output='no'
+  [[ "${2:-}" == '--json' ]] && json_output='yes'
+  get_api_key; local api_key="$REPLY"
+  api_request "$api_key" GET '/api/v1/integration/status'
+  (( API_CURL_RC == 0 )) || fail 'papat に接続できません'
+  require_success '接続確認に失敗しました'
+  if [[ "$json_output" == 'yes' ]]; then print -r -- "$API_BODY"; else print -r -- 'papat に接続しています。'; print -r -- "$API_BODY"; fi
+}
+
+function cmd_list() {
+  local json_output='no'
+  [[ "${2:-}" == '--json' ]] && json_output='yes'
+  get_api_key; local api_key="$REPLY"
+  api_request "$api_key" GET '/api/v1/galleries'
+  (( API_CURL_RC == 0 )) || fail 'ギャラリー一覧を取得できません'
+  require_success 'ギャラリー一覧を取得できません'
+  if [[ "$json_output" == 'yes' ]]; then print -r -- "$API_BODY"; else print -r -- 'ギャラリー一覧 (JSON):'; print -r -- "$API_BODY"; fi
+}
+
+function cmd_selections() {
+  local sid="$1" json_output='no'
+  [[ "${2:-}" == '--json' ]] && json_output='yes'
+  [[ "$sid" =~ '^[A-Za-z0-9_-]+$' ]] || fail 'sid の形式が正しくありません'
+  get_api_key; local api_key="$REPLY"
+  api_request "$api_key" GET "/api/v1/galleries/$sid/selections"
+  (( API_CURL_RC == 0 )) || fail 'セレクト結果を取得できません'
+  require_success 'セレクト結果を取得できません'
+  if [[ "$json_output" == 'yes' ]]; then print -r -- "$API_BODY"; else print -r -- 'セレクト結果 (JSON):'; print -r -- "$API_BODY"; fi
+}
+
+function cmd_extend() {
+  local sid="$1" operation_id payload
+  [[ "$sid" =~ '^[A-Za-z0-9_-]+$' ]] || fail 'sid の形式が正しくありません'
+  operation_id="$(command uuidgen | command tr '[:upper:]' '[:lower:]')"
+  json_escape "$operation_id"; payload="{\"client_op_id\":\"$REPLY\"}"
+  get_api_key; local api_key="$REPLY"
+  api_request "$api_key" POST "/api/v1/galleries/$sid/extend" \
+    --header 'Content-Type: application/json' --header "Idempotency-Key: $operation_id" --data-binary "$payload"
+  (( API_CURL_RC == 0 )) || fail '延長 API に接続できません'
+  require_success 'ギャラリーを延長できません'
+  print -r -- "$API_BODY"
+}
+
+function cmd_close() {
+  local sid="$1"
+  [[ "$sid" =~ '^[A-Za-z0-9_-]+$' ]] || fail 'sid の形式が正しくありません'
+  get_api_key; local api_key="$REPLY"
+  api_request "$api_key" DELETE "/api/v1/galleries/$sid"
+  (( API_CURL_RC == 0 )) || fail '終了 API に接続できません'
+  require_success 'ギャラリーを終了できません'
+  print -r -- "$API_BODY"
+}
+
+function cmd_jobs() {
+  local json_output='no' state_file log
+  [[ "${2:-}" == '--json' ]] && json_output='yes'
+  ensure_state_dirs
+  local found=0
+  if [[ "$json_output" == 'yes' ]]; then print -n '['; fi
+  for state_file in "$PAPAT_JOBS_DIR"/*/state(N); do
+    JOB_DIR="${state_file:h}"; STATE_FILE="$state_file"; load_state
+    log="$PAPAT_LOGS_DIR/$JOB_ID.log"
+    if [[ "$json_output" == 'yes' ]]; then
+      (( found )) && print -n ','
+      json_escape "$TITLE"; local title_json="$REPLY"
+      json_escape "$log"; local log_json="$REPLY"
+      print -n "{\"job_id\":\"$JOB_ID\",\"status\":\"$JOB_STATUS\",\"sid\":\"$SID\",\"title\":\"$title_json\",\"log\":\"$log_json\"}"
+    else
+      print -r -- "$JOB_ID  $JOB_STATUS  ${SID:-gallery-pending}  ${TITLE:-無題}"
+      print -r -- "  log: $log"
+      [[ "$JOB_STATUS" == 'failed' ]] && print -r -- "  再開: papat upload ${(q)SOURCE_DIR}"
+    fi
+    found=1
+  done
+  if [[ "$json_output" == 'yes' ]]; then print ']'; elif (( ! found )); then print -r -- '進行中または再開可能な job はありません。'; fi
+}
+
+function cmd_upload() {
+  shift
+  local folder='' title='' days='7' key_color='' passcode='' background='no' json_output='no'
+  (( $# > 0 )) || { usage; exit 2; }
+  folder="$1"; shift
+  while (( $# > 0 )); do
+    case "$1" in
+      --title) (( $# >= 2 )) || fail '--title には値が必要です'; title="$2"; shift 2 ;;
+      --days) (( $# >= 2 )) || fail '--days には値が必要です'; days="$2"; shift 2 ;;
+      --key-color) (( $# >= 2 )) || fail '--key-color には値が必要です'; key_color="$2"; shift 2 ;;
+      --passcode) (( $# >= 2 )) || fail '--passcode には値が必要です'; passcode="$2"; shift 2 ;;
+      --background) background='yes'; shift ;;
+      --json) json_output='yes'; shift ;;
+      *) fail "不明な引数です: $1" ;;
+    esac
+  done
+  [[ "$days" == 7 || "$days" == 14 ]] || fail '--days は 7 または 14 です'
+  if [[ -n "$key_color" && ! "$key_color" =~ '^#[[:xdigit:]]{6}$' ]]; then fail '--key-color は #RRGGBB 形式です'; fi
+  if [[ -n "$title" && ( "$title" == *$'\n'* || "$title" == *$'\r'* ) ]]; then fail 'タイトルに改行は使えません'; fi
+  if [[ -n "$passcode" ]] && { (( ${#passcode} < 4 || ${#passcode} > 64 )) || [[ "$passcode" == *$'\n'* || "$passcode" == *$'\r'* ]]; }; then
+    fail '--passcode は改行なしの4〜64文字です'
+  fi
+  if [[ -z "$title" ]]; then title="${folder:t}"; fi
+  if [[ -z "$passcode" ]]; then passcode="$(command uuidgen | command tr -d '-' | command cut -c1-8 | command tr '[:lower:]' '[:upper:]')"; fi
+  upload_new_or_resume "$folder" "$title" "$days" "$key_color" "$passcode" "$background" "$json_output"
+}
+
+function main() {
+  local command_name="${1:-}"
+  case "$command_name" in
+    -V|--version|version) print -r -- "$PAPAT_VERSION" ;;
+    login) cmd_login ;;
+    status) cmd_status "$@" ;;
+    upload) cmd_upload "$@" ;;
+    jobs) cmd_jobs "$@" ;;
+    list) cmd_list "$@" ;;
+    selections)
+      (( $# >= 2 )) || fail '使い方: papat selections <sid> [--json]'
+      cmd_selections "$2" "${3:-}"
+      ;;
+    extend)
+      (( $# == 2 )) || fail '使い方: papat extend <sid>'
+      cmd_extend "$2"
+      ;;
+    close)
+      (( $# == 2 )) || fail '使い方: papat close <sid>'
+      cmd_close "$2"
+      ;;
+    __worker)
+      (( $# == 2 )) || exit 2
+      ensure_state_dirs
+      run_worker "$2"
+      ;;
+    __sanitize_jpeg)
+      (( $# == 3 )) || exit 2
+      strip_jpeg_metadata "$2" "$3"
+      ;;
+    -h|--help|help|'') usage ;;
+    *) usage >&2; fail "不明なコマンドです: $command_name" ;;
+  esac
+}
+
+main "$@"

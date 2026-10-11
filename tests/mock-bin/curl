@@ -1,0 +1,91 @@
+#!/bin/zsh
+setopt no_unset
+function main() {
+local config='' url='' method='GET' data='' output='' headers='' content_type='' idempotency=''
+while (( $# > 0 )); do
+  case "$1" in
+    --config) config="$2"; shift 2 ;;
+    --url) url="$2"; shift 2 ;;
+    --request) method="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    --output) output="$2"; shift 2 ;;
+    --dump-header) headers="$2"; shift 2 ;;
+    --write-out) shift 2 ;;
+    --header)
+      case "$2" in
+        'Content-Type:'*) content_type="${2#Content-Type: }" ;;
+        'Idempotency-Key:'*) idempotency="${2#Idempotency-Key: }" ;;
+      esac
+      shift 2
+      ;;
+    --silent|--show-error) shift ;;
+    *) print -u2 -r -- "mock curl: unexpected arg $1"; exit 2 ;;
+  esac
+done
+if [[ "$config" == '-' ]]; then
+  IFS= read -r auth_config || exit 3
+  [[ "$auth_config" == 'header = "Authorization: Bearer sk''_live_mock_test"' ]] || exit 41
+  IFS= read -r accept_config || exit 3
+fi
+request_path="${url#https://papat.app}"
+http_status='200'
+body='{"ok":true}'
+header_body='HTTP/1.1 200 OK\r\n'
+if [[ "$request_path" == '/api/v1/integration/status' ]]; then
+  body='{"ok":true,"tenant_id":"demo","api":{"current":"v1"}}'
+elif [[ "$request_path" == '/api/v1/galleries' && "$method" == 'GET' ]]; then
+  body='{"ok":true,"galleries":[]}'
+elif [[ "$request_path" == '/api/v1/galleries' && "$method" == 'POST' ]]; then
+  print -r -- "$idempotency" >> "$MOCK_API_LOG"
+  cp "${data#@}" "$MOCK_CREATE_BODY"
+  http_status='201'
+  body='{"ok":true,"sid":"sid-test","tenant_id":"tenant-test","path":"/t/tenant-test/s/sid-test","expires_at":"2026-10-17T00:00:00.000Z"}'
+elif [[ "$request_path" == */files/manifest.json && "$method" == 'PUT' ]]; then
+  cp "${data#@}" "$MOCK_MANIFEST"
+  print -r -- manifest >> "$MOCK_API_LOG"
+  body='{"ok":true,"path":"manifest.json","bytes":100}'
+elif [[ "$request_path" == */files/photos/* && "$method" == 'PUT' ]]; then
+  filename="${request_path##*/}"
+  if [[ "$filename" == 'small.jpg' ]]; then cp "${data#@}" "$MOCK_UPLOADED_SMALL"; fi
+  if [[ "$filename" == 'large.jpg' ]]; then cp "${data#@}" "$MOCK_UPLOADED_LARGE"; fi
+  while ! command mkdir "$MOCK_ACTIVE_LOCK" 2>/dev/null; do command sleep 0.002; done
+  active=0; [[ -f "$MOCK_ACTIVE_FILE" ]] && active="$(<"$MOCK_ACTIVE_FILE")"
+  (( active++ ))
+  print -r -- "$active" > "$MOCK_ACTIVE_FILE"
+  max_active=0; [[ -f "$MOCK_MAX_ACTIVE" ]] && max_active="$(<"$MOCK_MAX_ACTIVE")"
+  (( active > max_active )) && print -r -- "$active" > "$MOCK_MAX_ACTIVE"
+  command rmdir "$MOCK_ACTIVE_LOCK"
+  command sleep 0.05
+  while ! command mkdir "$MOCK_ACTIVE_LOCK" 2>/dev/null; do command sleep 0.002; done
+  active="$(<"$MOCK_ACTIVE_FILE")"; (( active-- ))
+  print -r -- "$active" > "$MOCK_ACTIVE_FILE"
+  command rmdir "$MOCK_ACTIVE_LOCK"
+  print -r -- "$request_path" >> "$MOCK_API_LOG"
+  if [[ "$filename" == 'retry.jpg' ]]; then
+    count_file="$MOCK_RETRY_COUNT"
+    count=0; [[ -f "$count_file" ]] && count="$(<"$count_file")"
+    if (( count == 0 )); then
+      print -r -- 1 > "$count_file"
+      http_status='429'; body='{"ok":false,"code":"rate_limited"}'
+      header_body='HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\n'
+    fi
+  fi
+  if [[ "$filename" == 'fail-once.jpg' ]]; then
+    count_file="$MOCK_FAIL_COUNT"
+    count=0; [[ -f "$count_file" ]] && count="$(<"$count_file")"
+    if (( count == 0 )); then
+      print -r -- 1 > "$count_file"
+      http_status='500'; body='{"ok":false,"error":"temporary mock failure"}'
+    fi
+  fi
+  body="{\"ok\":true,\"path\":\"$request_path\",\"bytes\":8}"
+else
+  [[ "$method" == 'GET' && "$request_path" == */selections ]] && body='{"ok":true,"schema":"papat.selections/v1","adopted":[]}'
+  [[ "$method" == 'POST' && "$request_path" == */extend ]] && body='{"ok":true,"sid":"sid-test","extension_count":1}'
+  [[ "$method" == 'DELETE' && "$request_path" == */galleries/* ]] && body='{"ok":true,"sid":"sid-test","status":"closed"}'
+fi
+if [[ -n "$headers" ]]; then print -rn -- "$header_body" > "$headers"; fi
+if [[ -n "$output" ]]; then print -rn -- "$body" > "$output"; else print -rn -- "$body"; fi
+print -rn -- "$http_status"
+}
+main "$@"
