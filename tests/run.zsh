@@ -4,7 +4,7 @@ set -eu
 
 ROOT="${0:A:h:h}"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'find "$TMP" -depth -delete' EXIT
 export HOME="$TMP/home"
 export PATH="$ROOT/tests/mock-bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 export MOCK_API_LOG="$TMP/api.log"
@@ -37,7 +37,7 @@ papat_cli status --json > "$TMP/status.json"
 assert_contains "$TMP/status.json" '"current":"v1"'
 ok 'status sends Keychain API key through the mock only'
 
-[[ "$(papat_cli --version)" == '0.1.0' ]] || { print -u2 'version command returned an unexpected value'; exit 1; }
+[[ "$(papat_cli --version)" == '0.1.1' ]] || { print -u2 'version command returned an unexpected value'; exit 1; }
 ok 'version command reports the installed CLI version'
 
 if papat_cli upload "$TMP/photos" --days 3 > "$TMP/invalid.out" 2>&1; then
@@ -154,7 +154,16 @@ PUBLIC_EXPORT="$TMP/public-export"
 [[ ! -e "$PUBLIC_EXPORT/dist" && ! -e "$PUBLIC_EXPORT/docs" ]] || { print -u2 'public export included non-source artifacts'; exit 1; }
 [[ -f "$PUBLIC_EXPORT/.github/ISSUE_TEMPLATE/bug-report.yml" && -f "$PUBLIC_EXPORT/.github/ISSUE_TEMPLATE/config.yml" ]] || { print -u2 'public export omitted GitHub issue templates'; exit 1; }
 [[ "$(git -C "$PUBLIC_EXPORT" show -s --format='%an <%ae>%n%cn <%ce>' HEAD)" == $'Murayama Photo Office <hello@papat.app>\nMurayama Photo Office <hello@papat.app>' ]] || { print -u2 'public export commit identity is incorrect'; exit 1; }
+[[ -f "$PUBLIC_EXPORT/CHANGELOG.md" ]] || { print -u2 'public export omitted CHANGELOG.md'; exit 1; }
 ok 'public export contains the allowlisted files in a fresh one-commit repository'
+
+UPDATE_SOURCE="$TMP/update-source"
+cp -R "$ROOT" "$UPDATE_SOURCE"
+print -r -- 'Release export update test.' >> "$UPDATE_SOURCE/README.md"
+"$UPDATE_SOURCE/scripts/export-public.sh" "$PUBLIC_EXPORT" > "$TMP/export-update.out"
+[[ "$(git -C "$PUBLIC_EXPORT" rev-list --count HEAD)" == '2' ]] || { print -u2 'public export update did not add exactly one commit'; exit 1; }
+[[ "$(git -C "$PUBLIC_EXPORT" show -s --format='%an <%ae>; %cn <%ce>' HEAD)" == 'Murayama Photo Office <hello@papat.app>; Murayama Photo Office <hello@papat.app>' ]] || { print -u2 'public export update identity is incorrect'; exit 1; }
+ok 'public export updates an existing repository by adding a commit'
 
 UNSAFE_SOURCE="$TMP/unsafe-source"
 cp -R "$ROOT" "$UNSAFE_SOURCE"

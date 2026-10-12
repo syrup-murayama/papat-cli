@@ -4,9 +4,12 @@ description: Upload a user-selected local JPEG folder to papat and return its ga
 compatibility: Claude Code, Codex, and other Agent Skills-compatible agents on macOS.
 metadata:
   author: Murayama Photo Office
+  version: 0.1.1
 ---
 
 # Upload a folder to papat
+
+Release 0.1.1 or later removes EXIF (including GPS), XMP, and IPTC metadata from the temporary JPEG before upload.
 
 Use this skill only when the user has explicitly asked to upload a folder. Treat the folder path and upload options as user-provided input. The agent does not need to open, view, classify, or summarize any photo. Client photos should not be loaded into AI context.
 

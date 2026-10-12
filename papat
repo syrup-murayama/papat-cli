@@ -10,7 +10,7 @@ typeset -gr PAPAT_STATE_ROOT="$HOME/.local/state/papat-cli"
 typeset -gr PAPAT_JOBS_DIR="$PAPAT_STATE_ROOT/jobs"
 typeset -gr PAPAT_LOGS_DIR="$PAPAT_STATE_ROOT/logs"
 typeset -gr PAPAT_SRGB_PROFILE='/System/Library/ColorSync/Profiles/sRGB Profile.icc'
-typeset -gr PAPAT_VERSION='0.1.0'
+typeset -gr PAPAT_VERSION='0.1.1'
 typeset -gr PAPAT_PUBLIC_BASE='https://papat.app'
 
 typeset -g API_STATUS=''

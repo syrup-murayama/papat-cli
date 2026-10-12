@@ -1,5 +1,7 @@
 # papat CLI
 
+**Version 0.1.1**
+
 写真を書き出したフォルダを papat に送り、クライアントが選べるギャラリーを作るコマンドです。アップロードはバックグラウンドで続けられ、進み具合を後から確認できます。写真の中身を表示・分析しません。
 
 対応環境は **macOS のみ**です。zsh と macOS 標準の `curl`、`sips`、`shasum`、`security`、Perl を使います。Python、exiftool、Homebrew などの追加インストールは不要です。
@@ -72,6 +74,8 @@ tests/run.zsh
 ```
 
 ソースリポジトリのテストは Keychain、HTTP API、`sips` をローカルモックへ差し替えます。本番 papat API や外部サービスへ接続せず、写真も送信しません。
+
+変更履歴は [CHANGELOG.md](CHANGELOG.md) をご覧ください。
 
 ## 問い合わせ・セキュリティ
 
