@@ -10,7 +10,8 @@ typeset -gr PAPAT_STATE_ROOT="$HOME/.local/state/papat-cli"
 typeset -gr PAPAT_JOBS_DIR="$PAPAT_STATE_ROOT/jobs"
 typeset -gr PAPAT_LOGS_DIR="$PAPAT_STATE_ROOT/logs"
 typeset -gr PAPAT_SRGB_PROFILE='/System/Library/ColorSync/Profiles/sRGB Profile.icc'
-typeset -gr PAPAT_VERSION='0.1.1'
+typeset -gr PAPAT_VERSION='0.1.2'
+typeset -gr PAPAT_CLIENT_ID='papat-cli'
 typeset -gr PAPAT_PUBLIC_BASE='https://papat.app'
 
 typeset -g API_STATUS=''
@@ -35,6 +36,9 @@ typeset -g SHARE_URL=''
 typeset -g EXPIRES_AT=''
 typeset -ga SOURCE_FILES=()
 typeset -ga RELATIVE_FILES=()
+typeset -g SKIPPED_COUNT=0
+typeset -g SKIPPED_FOLDERS=''
+typeset -g LINKED_COUNT=0
 
 function fail() {
   print -u2 -r -- "papat: $*"
@@ -50,10 +54,10 @@ Usage:
   papat --version
   papat status [--json]
   papat upload <folder> [--title <title>] [--days 7|14]
-              [--key-color #RRGGBB] [--passcode <value>] [--background] [--json]
+              [--key-color #RRGGBB] [--passcode <value>] [--background] [--dry-run] [--json]
   papat jobs [--json]
   papat list [--json]
-  papat selections <sid> [--json]
+  papat selections <sid> [--json] [--schema v1|v2]
   papat extend <sid>
   papat close <sid>
 
@@ -89,7 +93,8 @@ function api_request() {
   response_file=$(command mktemp "$PAPAT_STATE_ROOT/status.XXXXXX") || fail '一時ファイルを作成できません'
   curl_args=(--silent --show-error --request "$method" --url "$PAPAT_API_BASE$request_path"
     --dump-header "$headers_file" --output "$body_file" --write-out '%{http_code}' "$@")
-  builtin printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\n' "$api_key" \
+  builtin printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/json"\nheader = "X-Papat-Client: %s"\n' \
+    "$api_key" "$PAPAT_CLIENT_ID/$PAPAT_VERSION" \
     | command curl --config - "${curl_args[@]}" > "$response_file"
   API_CURL_RC=$?
   API_STATUS=$(<"$response_file")
@@ -189,15 +194,60 @@ function write_state() {
   command mv -f "$temporary" "$STATE_FILE"
 }
 
+function skipped_folder_label() {
+  local -a names=("$@") shown
+  local name label=''
+  shown=("${(@)names[1,3]}")
+  for name in "${shown[@]}"; do label+="${label:+, }$name/"; done
+  (( ${#names} > 3 )) && label+=' ほか'
+  print -r -- "$label"
+}
+
+function warn_skipped_sources() {
+  local json_output="$1" message=''
+  (( SKIPPED_COUNT > 0 )) && message="サブフォルダの ${SKIPPED_COUNT} 枚は送りません（${SKIPPED_FOLDERS}）。"
+  (( LINKED_COUNT > 0 )) && message+="リンクの ${LINKED_COUNT} 枚は送りません。"
+  [[ -n "$message" ]] || return 0
+  message+="送るのは上の階の ${#RELATIVE_FILES} 枚です"
+  if [[ "$json_output" == 'yes' ]]; then print -u2 -r -- "$message"; else print -r -- "$message"; fi
+}
+
 function collect_sources() {
-  local dir="$1" file relative basename stem
-  typeset -A seen_stems
+  local dir="$1" file relative basename stem sub_relative
+  typeset -A seen_stems seen_folders
+  local -a folders
   SOURCE_FILES=()
   RELATIVE_FILES=()
+  SKIPPED_COUNT=0
+  SKIPPED_FOLDERS=''
+  LINKED_COUNT=0
+  # API は photos/<名前>.jpg の 1 階層だけを受ける。上の階だけを送り、サブフォルダの JPEG は数えて知らせる
   while IFS= read -r -d $'\0' file; do
     [[ "$file" == *$'\n'* ]] && fail '改行を含むファイル名には対応していません'
     SOURCE_FILES+=("$file")
-  done < <(command find "$dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) -print0)
+  done < <(command find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) -print0)
+  while IFS= read -r -d $'\0' file; do
+    [[ "$file" == *$'\n'* ]] && fail '改行を含むファイル名には対応していません'
+    (( SKIPPED_COUNT++ ))
+    sub_relative="${file#"$dir"/}"
+    if [[ -z "${seen_folders[${sub_relative%%/*}]-}" ]]; then
+      seen_folders[${sub_relative%%/*}]=1
+      folders+=("${sub_relative%%/*}")
+    fi
+  done < <(command find "$dir" -mindepth 2 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \) -print0)
+  # 上の階のリンク（シンボリックリンク）の JPEG は送らない。数えて知らせる
+  while IFS= read -r -d $'\0' file; do (( LINKED_COUNT++ )); done \
+    < <(command find "$dir" -maxdepth 1 -type l \( -iname '*.jpg' -o -iname '*.jpeg' \) -print0)
+  folders=("${(@o)folders}")
+  SKIPPED_FOLDERS="$(skipped_folder_label "${folders[@]}")"
+  if (( ${#SOURCE_FILES} == 0 && SKIPPED_COUNT > 0 )); then
+    local linked_note=''
+    (( LINKED_COUNT > 0 )) && linked_note="。リンクの ${LINKED_COUNT} 枚も送りません"
+    fail "上の階に JPEG がありません。サブフォルダの ${SKIPPED_COUNT} 枚は送りません（${SKIPPED_FOLDERS}）${linked_note}"
+  fi
+  if (( ${#SOURCE_FILES} == 0 && LINKED_COUNT > 0 )); then
+    fail "上の階に JPEG がありません。リンクの ${LINKED_COUNT} 枚は送りません"
+  fi
   SOURCE_FILES=("${(@o)SOURCE_FILES}")
   (( ${#SOURCE_FILES} > 0 )) || fail 'JPEG ファイルが見つかりません'
   (( ${#SOURCE_FILES} <= 900 )) || fail '1ギャラリーの上限は900枚です'
@@ -278,6 +328,46 @@ ${SHARE_URL}
   fi
 }
 
+function set_job_paths() {
+  folder_job_id "$1"
+  JOB_ID="$REPLY"
+  JOB_DIR="$PAPAT_JOBS_DIR/$JOB_ID"
+  STATE_FILE="$JOB_DIR/state"
+  LOG_FILE="$PAPAT_LOGS_DIR/$JOB_ID.log"
+}
+
+# 0.1.1 はサブフォルダの写真を photos/<sub>/<名前>.jpg で送り、API が 415 で断って failed になった。
+# その一覧（files.list に / を含む行）が残る failed の job は、今の版では再開できない
+function job_is_legacy_subfolder_failure() {
+  local line
+  [[ "$JOB_STATUS" == 'failed' && -f "$JOB_DIR/files.list" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == */* ]] && return 0
+  done < "$JOB_DIR/files.list"
+  return 1
+}
+
+function warn_superseded_job() {
+  local json_output="$1" when gallery detail message
+  local -a parts=()
+  when="$(command stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$STATE_FILE" 2>/dev/null)"
+  gallery="${TITLE}${TITLE:+${SID:+/}}${SID}"
+  [[ -n "$when" ]] && parts+=("$when")
+  [[ -n "$gallery" ]] && parts+=("ギャラリー $gallery")
+  detail="${(j:、:)parts}"
+  message="前に失敗した送り${detail:+（$detail）}は使わずに新しく作ります。前のギャラリーは papat の一覧から消せます"
+  if [[ "$json_output" == 'yes' ]]; then print -u2 -r -- "$message"; else print -r -- "$message"; fi
+}
+
+# 退ける: job と log を消さずに名前を変えて残す（jobs では superseded と表示される）
+function supersede_job() {
+  local suffix=".superseded-$(command date '+%Y%m%d-%H%M%S')" target
+  target="$PAPAT_JOBS_DIR/$JOB_ID$suffix"
+  while [[ -e "$target" ]]; do suffix+="-$RANDOM"; target="$PAPAT_JOBS_DIR/$JOB_ID$suffix"; done
+  command mv "$JOB_DIR" "$target" || fail '前の送りの記録を退けられません'
+  if [[ -f "$LOG_FILE" ]]; then command mv "$LOG_FILE" "$PAPAT_LOGS_DIR/$JOB_ID$suffix.log"; fi
+}
+
 function upload_new_or_resume() {
   local folder="$1" title="$2" days="$3" key_color="$4" passcode="$5" background="$6" json_output="$7"
   local resolved_dir response_dir hash_output
@@ -285,14 +375,15 @@ function upload_new_or_resume() {
   [[ "$folder" != *$'\n'* ]] || fail '改行を含むフォルダパスには対応していません'
   resolved_dir="$(builtin cd -- "$folder" 2>/dev/null && builtin pwd -P)" || fail "フォルダを開けません: $folder"
   collect_sources "$resolved_dir"
-  folder_job_id "$resolved_dir"
-  JOB_ID="$REPLY"
-  JOB_DIR="$PAPAT_JOBS_DIR/$JOB_ID"
-  STATE_FILE="$JOB_DIR/state"
-  LOG_FILE="$PAPAT_LOGS_DIR/$JOB_ID.log"
+  warn_skipped_sources "$json_output"
+  set_job_paths "$resolved_dir"
   if [[ -f "$STATE_FILE" ]]; then
     load_state
     if [[ "$JOB_STATUS" == 'completed' ]]; then command rm -rf "$JOB_DIR"; fi
+  fi
+  if [[ -f "$STATE_FILE" ]] && job_is_legacy_subfolder_failure; then
+    warn_superseded_job "$json_output"
+    supersede_job
   fi
   if [[ -f "$STATE_FILE" ]]; then
     load_state
@@ -700,11 +791,30 @@ function cmd_list() {
 }
 
 function cmd_selections() {
-  local sid="$1" json_output='no'
-  [[ "${2:-}" == '--json' ]] && json_output='yes'
+  local sid="$1" json_output='no' schema='' arg
+  shift
+  while (( $# > 0 )); do
+    arg="$1"
+    case "$arg" in
+      --json) json_output='yes' ;;
+      --schema)
+        (( $# >= 2 )) || fail '--schema には v1 または v2 を指定してください'
+        schema="$2"; shift ;;
+      --schema=*) schema="${arg#--schema=}" ;;
+      *) fail "不明なオプションです: $arg" ;;
+    esac
+    shift
+  done
+  case "$schema" in
+    ''|v1|papat.selections/v1) schema='' ;;
+    v2|papat.selections/v2) schema='papat.selections/v2' ;;
+    *) fail "--schema は v1 または v2 です: $schema" ;;
+  esac
   [[ "$sid" =~ '^[A-Za-z0-9_-]+$' ]] || fail 'sid の形式が正しくありません'
   get_api_key; local api_key="$REPLY"
-  api_request "$api_key" GET "/api/v1/galleries/$sid/selections"
+  local request_path="/api/v1/galleries/$sid/selections"
+  [[ -n "$schema" ]] && request_path+="?schema=$schema"
+  api_request "$api_key" GET "$request_path"
   (( API_CURL_RC == 0 )) || fail 'セレクト結果を取得できません'
   require_success 'セレクト結果を取得できません'
   if [[ "$json_output" == 'yes' ]]; then print -r -- "$API_BODY"; else print -r -- 'セレクト結果 (JSON):'; print -r -- "$API_BODY"; fi
@@ -741,6 +851,8 @@ function cmd_jobs() {
   if [[ "$json_output" == 'yes' ]]; then print -n '['; fi
   for state_file in "$PAPAT_JOBS_DIR"/*/state(N); do
     JOB_DIR="${state_file:h}"; STATE_FILE="$state_file"; load_state
+    local superseded='no'
+    if [[ "${JOB_DIR:t}" == *.superseded-* ]]; then superseded='yes'; JOB_ID="${JOB_DIR:t}"; JOB_STATUS='superseded'; fi
     log="$PAPAT_LOGS_DIR/$JOB_ID.log"
     if [[ "$json_output" == 'yes' ]]; then
       (( found )) && print -n ','
@@ -750,6 +862,7 @@ function cmd_jobs() {
     else
       print -r -- "$JOB_ID  $JOB_STATUS  ${SID:-gallery-pending}  ${TITLE:-無題}"
       print -r -- "  log: $log"
+      [[ "$superseded" == 'yes' ]] && print -r -- '  退けた送り: 新しく作り直したため再開しません（記録だけ残しています）'
       [[ "$JOB_STATUS" == 'failed' ]] && print -r -- "  再開: papat upload ${(q)SOURCE_DIR}"
     fi
     found=1
@@ -757,9 +870,32 @@ function cmd_jobs() {
   if [[ "$json_output" == 'yes' ]]; then print ']'; elif (( ! found )); then print -r -- '進行中または再開可能な job はありません。'; fi
 }
 
+function upload_dry_run() {
+  local folder="$1" title="$2" days="$3" json_output="$4" resolved_dir
+  [[ "$folder" != *$'\n'* ]] || fail '改行を含むフォルダパスには対応していません'
+  resolved_dir="$(builtin cd -- "$folder" 2>/dev/null && builtin pwd -P)" || fail "フォルダを開けません: $folder"
+  collect_sources "$resolved_dir"
+  set_job_paths "$resolved_dir"
+  if [[ -f "$STATE_FILE" ]]; then
+    load_state
+    if job_is_legacy_subfolder_failure; then warn_superseded_job "$json_output"; fi
+  fi
+  if [[ "$json_output" == 'yes' ]]; then
+    json_escape "$title"
+    print -r -- "{\"ok\":true,\"dry_run\":true,\"title\":\"$REPLY\",\"days\":$days,\"will_upload\":${#RELATIVE_FILES},\"skipped_subfolder\":$SKIPPED_COUNT,\"skipped_links\":$LINKED_COUNT}"
+  else
+    print -r -- "dry-run: 何も送らず、ギャラリーも作りません"
+    print -r -- "送る枚数: ${#RELATIVE_FILES}（上の階の JPEG）"
+    print -r -- "送らない枚数: ${SKIPPED_COUNT}（サブフォルダ${SKIPPED_COUNT:+: $SKIPPED_FOLDERS}）"
+    (( LINKED_COUNT > 0 )) && print -r -- "送らないリンク: ${LINKED_COUNT}（上の階のシンボリックリンク）"
+    print -r -- "タイトル: ${title:-無題} / 公開 ${days} 日"
+    print -r -- '料金・無料枠・上限は papat の現行プランに従います。`papat status` で確認してください'
+  fi
+}
+
 function cmd_upload() {
   shift
-  local folder='' title='' days='7' key_color='' passcode='' background='no' json_output='no'
+  local folder='' title='' days='7' key_color='' passcode='' background='no' json_output='no' dry_run='no'
   (( $# > 0 )) || { usage; exit 2; }
   folder="$1"; shift
   while (( $# > 0 )); do
@@ -769,6 +905,7 @@ function cmd_upload() {
       --key-color) (( $# >= 2 )) || fail '--key-color には値が必要です'; key_color="$2"; shift 2 ;;
       --passcode) (( $# >= 2 )) || fail '--passcode には値が必要です'; passcode="$2"; shift 2 ;;
       --background) background='yes'; shift ;;
+      --dry-run) dry_run='yes'; shift ;;
       --json) json_output='yes'; shift ;;
       *) fail "不明な引数です: $1" ;;
     esac
@@ -780,6 +917,7 @@ function cmd_upload() {
     fail '--passcode は改行なしの4〜64文字です'
   fi
   if [[ -z "$title" ]]; then title="${folder:t}"; fi
+  if [[ "$dry_run" == 'yes' ]]; then upload_dry_run "$folder" "$title" "$days" "$json_output"; return; fi
   if [[ -z "$passcode" ]]; then passcode="$(command uuidgen | command tr -d '-' | command cut -c1-8 | command tr '[:lower:]' '[:upper:]')"; fi
   upload_new_or_resume "$folder" "$title" "$days" "$key_color" "$passcode" "$background" "$json_output"
 }
@@ -794,8 +932,8 @@ function main() {
     jobs) cmd_jobs "$@" ;;
     list) cmd_list "$@" ;;
     selections)
-      (( $# >= 2 )) || fail '使い方: papat selections <sid> [--json]'
-      cmd_selections "$2" "${3:-}"
+      (( $# >= 2 )) || fail '使い方: papat selections <sid> [--json] [--schema v1|v2]'
+      cmd_selections "${@:2}"
       ;;
     extend)
       (( $# == 2 )) || fail '使い方: papat extend <sid>'

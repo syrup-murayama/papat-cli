@@ -92,7 +92,7 @@ GIT_AUTHOR_NAME='Murayama Photo Office' \
 GIT_AUTHOR_EMAIL='hello@papat.app' \
 GIT_COMMITTER_NAME='Murayama Photo Office' \
 GIT_COMMITTER_EMAIL='hello@papat.app' \
-  git -C "$destination" commit -m "Release 0.1.1" >/dev/null
+  git -C "$destination" commit -m "Release 0.1.2" >/dev/null
 if ! check_tree "$destination"; then
   echo "public export rejected after commit; review and remove the destination manually" >&2
   exit 1

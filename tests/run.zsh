@@ -8,6 +8,7 @@ trap 'find "$TMP" -depth -delete' EXIT
 export HOME="$TMP/home"
 export PATH="$ROOT/tests/mock-bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
 export MOCK_API_LOG="$TMP/api.log"
+export MOCK_REJECTED_LOG="$TMP/rejected.log"
 export MOCK_CREATE_BODY="$TMP/create.json"
 export MOCK_MANIFEST="$TMP/manifest.json"
 export MOCK_RETRY_COUNT="$TMP/retry.count"
@@ -37,7 +38,7 @@ papat_cli status --json > "$TMP/status.json"
 assert_contains "$TMP/status.json" '"current":"v1"'
 ok 'status sends Keychain API key through the mock only'
 
-[[ "$(papat_cli --version)" == '0.1.1' ]] || { print -u2 'version command returned an unexpected value'; exit 1; }
+[[ "$(papat_cli --version)" == '0.1.2' ]] || { print -u2 'version command returned an unexpected value'; exit 1; }
 ok 'version command reports the installed CLI version'
 
 if papat_cli upload "$TMP/photos" --days 3 > "$TMP/invalid.out" 2>&1; then
@@ -67,10 +68,12 @@ assert_contains "$TMP/jobs.json" '"status":"failed"'
 papat_cli upload "$TMP/photos" --json > "$TMP/resume.json" 2> "$TMP/resume.err"
 assert_contains "$TMP/resume.json" '"sid":"sid-test"'
 assert_contains "$TMP/resume.err" 'manifest を更新'
-assert_contains "$MOCK_MANIFEST" '"count":5'
+assert_contains "$MOCK_MANIFEST" '"count":4'
 assert_contains "$MOCK_MANIFEST" '"key_color":"#0066CC"'
 assert_contains "$MOCK_MANIFEST" 'papat-cli-'
-assert_contains "$MOCK_API_LOG" '/photos/sub%20folder/%E6%97%A5%E6%9C%AC%20photo.jpg'
+assert_contains "$TMP/first.out" 'サブフォルダの 1 枚は送りません（sub folder/）。送るのは上の階の 4 枚です'
+if [[ "$(<"$MOCK_API_LOG")" == *'sub%20folder'* ]]; then print -u2 'a subfolder photo was sent'; exit 1; fi
+[[ ! -s "$MOCK_REJECTED_LOG" ]] || { print -u2 'the mock API rejected a path (415)'; exit 1; }
 assert_contains "$MOCK_SIPS_LOG" 'large.jpg'
 if [[ "$(<"$MOCK_SIPS_LOG")" == *small.jpg* ]]; then print -u2 'small sRGB JPEG was unnecessarily converted'; exit 1; fi
 ok 'resume skips completed files; sips conversion and manifest metadata are correct'
@@ -126,6 +129,143 @@ PERL
 [[ "$(/usr/bin/sips -g profile "$REAL_CLEAN" | command sed -n 's/.*profile: //p')" == *sRGB* ]] || { print -u2 'resized JPEG lacks the sRGB profile'; exit 1; }
 ok 'real sips resize is cleaned, receives an ICC profile, and image scan bytes are unchanged'
 
+# サブフォルダの写真は送らない（API は photos/<名前>.jpg の 1 階層だけを受ける）
+mkdir -p "$TMP/only-sub/sub1" "$TMP/only-sub/sub2/deep"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/only-sub/sub1/a.jpg"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/only-sub/sub2/deep/b.JPG"
+api_lines_before="$(wc -l < "$MOCK_API_LOG")"
+if papat_cli upload "$TMP/only-sub" > "$TMP/only-sub.out" 2>&1; then
+  print -u2 'folder with only subfolder JPEGs unexpectedly succeeded'; exit 1
+fi
+assert_contains "$TMP/only-sub.out" '上の階に JPEG がありません。サブフォルダの 2 枚は送りません（sub1/, sub2/）'
+[[ "$(wc -l < "$MOCK_API_LOG")" == "$api_lines_before" ]] || { print -u2 'API was called for a folder with no top-level JPEG'; exit 1; }
+ok 'no top-level JPEG and only subfolder JPEGs: stops before creating a gallery'
+
+mkdir -p "$TMP/mixed/a" "$TMP/mixed/b" "$TMP/mixed/c" "$TMP/mixed/d" "$TMP/mixed/e/deep"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/mixed/top1.jpg"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/mixed/top2.JPEG"
+for sub in a b c d e/deep; do cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/mixed/$sub/x.jpg"; done
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/mixed/a/y.jpg"
+: > "$MOCK_REJECTED_LOG"
+papat_cli upload "$TMP/mixed" --json > "$TMP/mixed.json" 2> "$TMP/mixed.err"
+assert_contains "$TMP/mixed.json" '"sid":"sid-test"'
+if [[ "$(<"$TMP/mixed.json")" == *サブフォルダ* ]]; then print -u2 'the notice leaked into the JSON on stdout'; exit 1; fi
+assert_contains "$TMP/mixed.err" 'サブフォルダの 6 枚は送りません（a/, b/, c/ ほか）。送るのは上の階の 2 枚です'
+assert_contains "$MOCK_MANIFEST" '"count":2'
+[[ ! -s "$MOCK_REJECTED_LOG" ]] || { print -u2 'the mock API rejected a path (415)'; exit 1; }
+ok 'subfolder JPEGs are counted and announced (first 3 folders + ほか), only top-level files are sent'
+
+api_lines_before="$(wc -l < "$MOCK_API_LOG")"
+jobs_before="$(ls -1 "$HOME/.local/state/papat-cli/jobs" | wc -l)"
+papat_cli upload "$TMP/mixed" --dry-run > "$TMP/dry.out" 2>&1
+assert_contains "$TMP/dry.out" '送る枚数: 2'
+assert_contains "$TMP/dry.out" '送らない枚数: 6（サブフォルダ: a/, b/, c/ ほか）'
+papat_cli upload "$TMP/mixed" --dry-run --json > "$TMP/dry.json"
+assert_contains "$TMP/dry.json" '"dry_run":true,"title":"mixed","days":7,"will_upload":2,"skipped_subfolder":6'
+if papat_cli upload "$TMP/only-sub" --dry-run > "$TMP/dry-only-sub.out" 2>&1; then print -u2 'dry-run with no top-level JPEG unexpectedly succeeded'; exit 1; fi
+assert_contains "$TMP/dry-only-sub.out" '上の階に JPEG がありません。サブフォルダの 2 枚は送りません'
+[[ "$(wc -l < "$MOCK_API_LOG")" == "$api_lines_before" ]] || { print -u2 'dry-run called the API'; exit 1; }
+[[ "$(ls -1 "$HOME/.local/state/papat-cli/jobs" | wc -l)" == "$jobs_before" ]] || { print -u2 'dry-run left a job behind'; exit 1; }
+ok 'upload --dry-run reports will-send / skipped counts and sends nothing'
+
+# 0.1.1 の形（サブフォルダ入りの files.list）で failed になった job は、退けて新しく作る
+function make_legacy_job() {
+  local dir="$1" job_status="${2:-failed}" slash="${3:-yes}" job_id job_dir
+  job_id="$(print -rn -- "$dir" | shasum -a 256 | cut -d' ' -f1)"
+  job_dir="$HOME/.local/state/papat-cli/jobs/$job_id"
+  rm -rf "$job_dir" "$HOME/.local/state/papat-cli/jobs/$job_id".superseded-*(N) "$HOME/.local/state/papat-cli/logs/$job_id"*.log(N)
+  mkdir -p "$job_dir" "$HOME/.local/state/papat-cli/logs"
+  print -r -- "job_id=$job_id
+status=$job_status
+pid=999999
+sid=sid-old
+tenant_id=tenant-test
+source_dir=$dir
+title=旧い題
+days=7
+key_color=
+passcode=OLDCODE1
+idempotency_key=old-key
+share_url=https://papat.app/t/tenant-test/s/sid-old/
+expires_at=" > "$job_dir/state"
+  if [[ "$slash" == yes ]]; then print -r -- $'a.jpg\nsub/x.jpg' > "$job_dir/files.list"; else print -r -- $'a.jpg\nz.jpg' > "$job_dir/files.list"; fi
+  print -r -- 'old log' > "$HOME/.local/state/papat-cli/logs/$job_id.log"
+  touch -t 202611010930 "$job_dir/state"
+  REPLY="$job_id"
+}
+mkdir -p "$TMP/legacy/sub"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/legacy/a.jpg"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/legacy/sub/x.jpg"
+LEGACY_DIR="$(cd "$TMP/legacy" && pwd -P)"
+JOBS_ROOT="$HOME/.local/state/papat-cli/jobs"
+
+make_legacy_job "$LEGACY_DIR"; legacy_id="$REPLY"
+jobs_snapshot="$(ls -1 "$JOBS_ROOT"; ls -1 "$HOME/.local/state/papat-cli/logs")"
+api_lines_before="$(wc -l < "$MOCK_API_LOG")"
+papat_cli upload "$TMP/legacy" --dry-run > "$TMP/legacy-dry.out" 2>&1
+assert_contains "$TMP/legacy-dry.out" '前に失敗した送り（2026-11-01 09:30、ギャラリー 旧い題/sid-old）は使わずに新しく作ります。前のギャラリーは papat の一覧から消せます'
+[[ "$(ls -1 "$JOBS_ROOT"; ls -1 "$HOME/.local/state/papat-cli/logs")" == "$jobs_snapshot" ]] || { print -u2 'dry-run changed the job records'; exit 1; }
+[[ "$(wc -l < "$MOCK_API_LOG")" == "$api_lines_before" ]] || { print -u2 'dry-run called the API'; exit 1; }
+
+papat_cli upload "$TMP/legacy" --json > "$TMP/legacy.json" 2> "$TMP/legacy.err"
+assert_contains "$TMP/legacy.err" '前に失敗した送り（2026-11-01 09:30、ギャラリー 旧い題/sid-old）は使わずに新しく作ります。前のギャラリーは papat の一覧から消せます'
+assert_contains "$TMP/legacy.json" '"sid":"sid-test"'
+assert_contains "$MOCK_MANIFEST" '"count":1'
+superseded=("$JOBS_ROOT/$legacy_id".superseded-*(N))
+(( ${#superseded} == 1 )) || { print -u2 'the old job was not kept under a superseded name'; exit 1; }
+assert_contains "${superseded[1]}/state" 'sid=sid-old'
+assert_contains "${superseded[1]}/files.list" 'sub/x.jpg'
+superseded_logs=("$HOME/.local/state/papat-cli/logs/$legacy_id".superseded-*.log(N))
+(( ${#superseded_logs} == 1 )) || { print -u2 'the old log was not kept'; exit 1; }
+assert_contains "${superseded_logs[1]}" 'old log'
+papat_cli jobs > "$TMP/jobs-superseded.out"
+assert_contains "$TMP/jobs-superseded.out" "$legacy_id.superseded-"
+assert_contains "$TMP/jobs-superseded.out" 'superseded  sid-old  旧い題'
+assert_contains "$TMP/jobs-superseded.out" '退けた送り: 新しく作り直したため再開しません'
+if [[ "$(grep -A3 'superseded  sid-old' "$TMP/jobs-superseded.out")" == *'再開: papat upload'* ]]; then print -u2 'a superseded job shows a resume hint'; exit 1; fi
+papat_cli jobs --json > "$TMP/jobs-superseded.json"
+assert_contains "$TMP/jobs-superseded.json" '"status":"superseded"'
+ok '0.1.1-style failed job with subfolder files.list: announced, set aside under a new name (state and log kept), dry-run changes nothing'
+
+# 条件に当たらない job は今のまま「JPEG一覧が変わりました」で止まる
+make_legacy_job "$LEGACY_DIR" failed no
+if papat_cli upload "$TMP/legacy" > "$TMP/legacy-nomatch.out" 2>&1; then print -u2 'failed job without a slash line should still stop'; exit 1; fi
+assert_contains "$TMP/legacy-nomatch.out" 'JPEG一覧が変わりました'
+make_legacy_job "$LEGACY_DIR" running yes
+if papat_cli upload "$TMP/legacy" > "$TMP/legacy-running.out" 2>&1; then print -u2 'non-failed job with a slash line should still stop'; exit 1; fi
+assert_contains "$TMP/legacy-running.out" 'JPEG一覧が変わりました'
+leftover=("$JOBS_ROOT"/*.superseded-*(N))
+(( ${#leftover} == 0 )) || { print -u2 'a job outside the condition was set aside'; exit 1; }
+rm -rf "$JOBS_ROOT/$REPLY"
+ok 'failed job without a slash line, or non-failed job with one, keeps the old behavior'
+
+# 上の階のリンクされた JPEG は送らず、数えて知らせる
+mkdir -p "$TMP/linked" "$TMP/linked-only" "$TMP/link-src"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/link-src/real.jpg"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/linked/own.jpg"
+ln -s "$TMP/link-src/real.jpg" "$TMP/linked/alias1.jpg"
+ln -s "$TMP/link-src/real.jpg" "$TMP/linked/alias2.JPEG"
+ln -s "$TMP/link-src/real.jpg" "$TMP/linked-only/alias.jpg"
+papat_cli upload "$TMP/linked" --dry-run > "$TMP/linked-dry.out" 2>&1
+assert_contains "$TMP/linked-dry.out" '送る枚数: 1'
+assert_contains "$TMP/linked-dry.out" '送らないリンク: 2'
+: > "$MOCK_REJECTED_LOG"
+papat_cli upload "$TMP/linked" > "$TMP/linked.out" 2>&1
+assert_contains "$TMP/linked.out" 'リンクの 2 枚は送りません。送るのは上の階の 1 枚です'
+assert_contains "$MOCK_MANIFEST" '"count":1'
+api_lines_before="$(wc -l < "$MOCK_API_LOG")"
+if papat_cli upload "$TMP/linked-only" > "$TMP/linked-only.out" 2>&1; then print -u2 'folder with only linked JPEGs unexpectedly succeeded'; exit 1; fi
+assert_contains "$TMP/linked-only.out" '上の階に JPEG がありません。リンクの 1 枚は送りません'
+[[ "$(wc -l < "$MOCK_API_LOG")" == "$api_lines_before" ]] || { print -u2 'API was called for a folder with only linked JPEGs'; exit 1; }
+ok 'linked top-level JPEGs are counted and announced, not sent; only-link folder stops before creating a gallery'
+
+mkdir -p "$TMP/flat"
+cp "$ROOT/tests/fixtures/synthetic-metadata.jpg" "$TMP/flat/one.jpg"
+papat_cli upload "$TMP/flat" > "$TMP/flat.out" 2>&1
+if [[ "$(<"$TMP/flat.out")" == *サブフォルダ* ]]; then print -u2 'notice shown for a folder without subfolders'; exit 1; fi
+assert_contains "$MOCK_MANIFEST" '"count":1'
+ok 'folder without subfolders prints no notice'
+
 papat_cli jobs --json > "$TMP/completed.json"
 assert_contains "$TMP/completed.json" '"status":"completed"'
 
@@ -138,6 +278,27 @@ assert_contains "$TMP/extend.json" '"extension_count":1'
 papat_cli close sid-test > "$TMP/close.json"
 assert_contains "$TMP/close.json" '"status":"closed"'
 ok 'list, selections, extend, and close use the v1 API contract'
+
+export MOCK_REQUEST_LOG="$TMP/requests.log"
+papat_cli selections sid-test --json > "$TMP/sel-default.json"
+papat_cli selections sid-test --schema v1 --json > "$TMP/sel-v1.json"
+papat_cli selections sid-test --json --schema v2 > "$TMP/sel-v2.json"
+papat_cli selections sid-test --schema=papat.selections/v2 --json > "$TMP/sel-v2-full.json"
+assert_contains "$TMP/sel-default.json" 'papat.selections/v1'
+assert_contains "$TMP/sel-v1.json" 'papat.selections/v1'
+assert_contains "$TMP/sel-v2.json" 'papat.selections/v2'
+assert_contains "$TMP/sel-v2-full.json" 'papat.selections/v2'
+[[ "$(command sed -n '1p' "$MOCK_REQUEST_LOG")" == 'GET /api/v1/galleries/sid-test/selections header = "X-Papat-Client: papat-cli/0.1.2"' ]] \
+  || { print -u2 'default selections URL or client header changed'; exit 1; }
+[[ "$(command sed -n '2p' "$MOCK_REQUEST_LOG")" == 'GET /api/v1/galleries/sid-test/selections header = "X-Papat-Client: papat-cli/0.1.2"' ]] \
+  || { print -u2 '--schema v1 must keep the plain v1 URL'; exit 1; }
+[[ "$(command sed -n '3p;4p' "$MOCK_REQUEST_LOG" | command sort -u)" == 'GET /api/v1/galleries/sid-test/selections?schema=papat.selections/v2 header = "X-Papat-Client: papat-cli/0.1.2"' ]] \
+  || { print -u2 '--schema v2 URL or client header is wrong'; exit 1; }
+if papat_cli selections sid-test --schema v3 > "$TMP/bad-schema.out" 2>&1; then
+  print -u2 'unknown schema unexpectedly succeeded'; exit 1
+fi
+unset MOCK_REQUEST_LOG
+ok 'selections: default and v1 keep the plain URL, --schema v2 adds ?schema=papat.selections/v2, X-Papat-Client is sent'
 
 CHECKSUM_DIR="$TMP/checksum with spaces"
 mkdir -p "$CHECKSUM_DIR"

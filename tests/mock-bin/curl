@@ -1,5 +1,5 @@
 #!/bin/zsh
-setopt no_unset
+setopt no_unset extendedglob
 function main() {
 local config='' url='' method='GET' data='' output='' headers='' content_type='' idempotency=''
 while (( $# > 0 )); do
@@ -26,8 +26,13 @@ if [[ "$config" == '-' ]]; then
   IFS= read -r auth_config || exit 3
   [[ "$auth_config" == 'header = "Authorization: Bearer sk''_live_mock_test"' ]] || exit 41
   IFS= read -r accept_config || exit 3
+  IFS= read -r client_config || exit 3
+  [[ "$client_config" == 'header = "X-Papat-Client: papat-cli/'[0-9]*'"' ]] || exit 42
+  [[ -z "${MOCK_REQUEST_LOG:-}" ]] || print -r -- "$method ${url#https://papat.app} $client_config" >> "$MOCK_REQUEST_LOG"
 fi
 request_path="${url#https://papat.app}"
+request_query=''
+if [[ "$request_path" == *\?* ]]; then request_query="${request_path#*\?}"; request_path="${request_path%%\?*}"; fi
 http_status='200'
 body='{"ok":true}'
 header_body='HTTP/1.1 200 OK\r\n'
@@ -45,6 +50,16 @@ elif [[ "$request_path" == */files/manifest.json && "$method" == 'PUT' ]]; then
   print -r -- manifest >> "$MOCK_API_LOG"
   body='{"ok":true,"path":"manifest.json","bytes":100}'
 elif [[ "$request_path" == */files/photos/* && "$method" == 'PUT' ]]; then
+  # 本物の API と同じく photos/<名前>.jpg|jpeg 以外（サブフォルダを含む）は 415
+  photo_name="${request_path##*/files/photos/}"
+  if [[ "$photo_name" == */* || ! "$photo_name" == (#i)*.jpg && ! "$photo_name" == (#i)*.jpeg ]]; then
+    print -r -- "$request_path" >> "${MOCK_REJECTED_LOG:-/dev/null}"
+    if [[ -n "$headers" ]]; then print -rn -- 'HTTP/1.1 415 Unsupported Media Type\r\n' > "$headers"; fi
+    body='{"ok":false,"code":"unsupported_media_type","error":"only JPEG photos and manifest.json are supported"}'
+    if [[ -n "$output" ]]; then print -rn -- "$body" > "$output"; else print -rn -- "$body"; fi
+    print -rn -- '415'
+    return 0
+  fi
   filename="${request_path##*/}"
   if [[ "$filename" == 'small.jpg' ]]; then cp "${data#@}" "$MOCK_UPLOADED_SMALL"; fi
   if [[ "$filename" == 'large.jpg' ]]; then cp "${data#@}" "$MOCK_UPLOADED_LARGE"; fi
@@ -81,6 +96,7 @@ elif [[ "$request_path" == */files/photos/* && "$method" == 'PUT' ]]; then
   body="{\"ok\":true,\"path\":\"$request_path\",\"bytes\":8}"
 else
   [[ "$method" == 'GET' && "$request_path" == */selections ]] && body='{"ok":true,"schema":"papat.selections/v1","adopted":[]}'
+  [[ "$method" == 'GET' && "$request_path" == */selections && "$request_query" == 'schema=papat.selections/v2' ]] && body='{"ok":true,"schema":"papat.selections/v2","photos":[]}'
   [[ "$method" == 'POST' && "$request_path" == */extend ]] && body='{"ok":true,"sid":"sid-test","extension_count":1}'
   [[ "$method" == 'DELETE' && "$request_path" == */galleries/* ]] && body='{"ok":true,"sid":"sid-test","status":"closed"}'
 fi
